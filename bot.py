@@ -1,9 +1,11 @@
 """
-YouTube Downloader Telegram Bot — Advanced UI
-Single File Version | aiogram 3 + yt-dlp
+YouTube Downloader Telegram Bot — Advanced UI (FULL FIXED)
+Single File | aiogram 3 + yt-dlp | Render-ready
 """
 
-import asyncio, os, re, time, logging, json, hashlib, secrets
+import asyncio, os, re, time, logging, json, hashlib, secrets, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 import aiohttp
 import yt_dlp
 from dotenv import load_dotenv
@@ -31,10 +33,9 @@ ADMIN_ID     = int(os.getenv("ADMIN_ID", "6840524720"))
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# YtUltra API
-YTULTRA_API    = "https://api.ytultra.com/ikool/youtube/download"
-YTULTRA_MERGE  = "https://api.ytultra.com/ikool/media/download/merge"
-YTULTRA_SALT   = os.getenv("YTULTRA_SALT", "ytultra_salt_placeholder")  # <-- browser JS se nikaal ke yaha daalein
+YTULTRA_API   = "https://api.ytultra.com/ikool/youtube/download"
+YTULTRA_MERGE = "https://api.ytultra.com/ikool/media/download/merge"
+YTULTRA_SALT  = os.getenv("YTULTRA_SALT", "ytultra_salt_placeholder")
 
 HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
@@ -60,6 +61,30 @@ router = Router()
 START_TIME = time.time()
 
 # ═══════════════════════════════════════════════════
+#  🌐  DUMMY HTTP SERVER (for Render port binding)
+# ═══════════════════════════════════════════════════
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive OK")
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+
+def start_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    try:
+        srv = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log.info(f"🌐 Health server on port {port}")
+    except Exception as e:
+        log.warning(f"Health server failed: {e}")
+
+# ═══════════════════════════════════════════════════
 #  🧠  FSM STATES
 # ═══════════════════════════════════════════════════
 class S(StatesGroup):
@@ -73,7 +98,7 @@ YT_REGEX = re.compile(
     r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|embed/|v/))([\w-]{11})"
 )
 
-def vid_id(url: str) -> str | None:
+def vid_id(url: str):
     m = YT_REGEX.search(url or "")
     return m.group(1) if m else None
 
@@ -83,22 +108,17 @@ def human_size(b: float) -> str:
         b /= 1024
     return f"{b:.1f}TB"
 
-def fmt_dur(s: int) -> str:
+def fmt_dur(s) -> str:
     s = int(s or 0)
     h, r = divmod(s, 3600); m, sec = divmod(r, 60)
     return f"{h}h {m}m {sec}s" if h else f"{m}m {sec}s"
 
 # ═══════════════════════════════════════════════════
-#  🌐  YTULTRA API (with dynamic sign/nonce)
+#  🌐  YTULTRA API (optional engine)
 # ═══════════════════════════════════════════════════
-def _nonce() -> str:
-    return secrets.token_hex(16)
-
-def _ts() -> str:
-    return str(int(time.time() * 1000))
-
-def _sign(ts: str, nonce: str) -> str:
-    """Formula based on ytultra JS bundle. Update SALT to match."""
+def _nonce(): return secrets.token_hex(16)
+def _ts():    return str(int(time.time() * 1000))
+def _sign(ts, nonce):
     return hashlib.sha256(f"{nonce}{ts}{YTULTRA_SALT}".encode()).hexdigest()
 
 async def ytultra_fetch(url: str) -> dict:
@@ -114,7 +134,7 @@ async def ytultra_fetch(url: str) -> dict:
         return {"error": str(e)}
 
 # ═══════════════════════════════════════════════════
-#  ⬇️  YT-DLP DOWNLOAD (primary engine)
+#  ⬇️  YT-DLP ENGINE
 # ═══════════════════════════════════════════════════
 def _vopts(q: str) -> dict:
     fmt = (f"bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -127,6 +147,8 @@ def _vopts(q: str) -> dict:
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "concurrent_fragment_downloads": 4,
         "retries": 3,
+        "nocheckcertificate": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
 
 async def dl_video(url: str, q: str) -> dict:
@@ -159,6 +181,7 @@ async def dl_audio(url: str, bitrate: str = "192") -> dict:
                 "preferredquality": bitrate,
             }],
             "quiet": True, "no_warnings": True, "noplaylist": True,
+            "nocheckcertificate": True,
         }
         with yt_dlp.YoutubeDL(opts) as y:
             info = y.extract_info(url, download=True)
@@ -308,16 +331,22 @@ async def cb_mode_audio(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 # ═══════════════════════════════════════════════════
-#  🔗  RECEIVE URL
+#  🔗  RECEIVE URL (FIXED: send_chat_action)
 # ═══════════════════════════════════════════════════
 @router.message(S.wait_video_url)
 async def on_url_video(m: Message, state: FSMContext):
     vid = vid_id(m.text or "")
     if not vid:
-        return await m.reply("❌ <b>Invalid YouTube link!</b>\nTry: <code>https://youtu.be/xxxxx</code>",
-                             parse_mode=ParseMode.HTML)
+        return await m.reply(
+            "❌ <b>Invalid YouTube link!</b>\nTry: <code>https://youtu.be/xxxxx</code>",
+            parse_mode=ParseMode.HTML,
+        )
     await state.clear()
-    await m.answer_chat_action(ChatAction.TYPING)
+    # ✅ FIX: bot.send_chat_action (not m.answer_chat_action)
+    try:
+        await m.bot.send_chat_action(chat_id=m.chat.id, action=ChatAction.TYPING)
+    except Exception:
+        pass
     await m.reply(
         f"🎬 <b>Video Selected</b>\n🆔 <code>{vid}</code>\n\n👇 <i>Choose quality:</i>",
         parse_mode=ParseMode.HTML, reply_markup=kb_quality(vid),
@@ -327,10 +356,16 @@ async def on_url_video(m: Message, state: FSMContext):
 async def on_url_audio(m: Message, state: FSMContext):
     vid = vid_id(m.text or "")
     if not vid:
-        return await m.reply("❌ <b>Invalid YouTube link!</b>",
-                             parse_mode=ParseMode.HTML)
+        return await m.reply(
+            "❌ <b>Invalid YouTube link!</b>",
+            parse_mode=ParseMode.HTML,
+        )
     await state.clear()
-    await m.answer_chat_action(ChatAction.TYPING)
+    # ✅ FIX: bot.send_chat_action
+    try:
+        await m.bot.send_chat_action(chat_id=m.chat.id, action=ChatAction.TYPING)
+    except Exception:
+        pass
     await m.reply(
         f"🎵 <b>Audio Selected</b>\n🆔 <code>{vid}</code>\n\n👇 <i>Choose bitrate:</i>",
         parse_mode=ParseMode.HTML, reply_markup=kb_audio(vid),
@@ -344,25 +379,38 @@ async def cb_dl_video(c: CallbackQuery):
     _, vid, q = c.data.split(":")
     url = f"https://youtube.com/watch?v={vid}"
     await c.answer("⏳ Downloading...")
-    status = await c.message.edit_text(
-        f"📥 <b>Downloading {q}p...</b>\n\n"
-        f"🆔 <code>{vid}</code>\n"
-        "⏳ <i>Please wait...</i>",
-        parse_mode=ParseMode.HTML, reply_markup=kb_cancel(vid),
-    )
-    await c.message.bot.send_chat_action(c.message.chat.id, ChatAction.UPLOAD_VIDEO)
+    try:
+        status = await c.message.edit_text(
+            f"📥 <b>Downloading {q}p...</b>\n\n"
+            f"🆔 <code>{vid}</code>\n"
+            "⏳ <i>Please wait...</i>",
+            parse_mode=ParseMode.HTML, reply_markup=kb_cancel(vid),
+        )
+    except Exception:
+        status = await c.message.answer(
+            f"📥 <b>Downloading {q}p...</b>",
+            parse_mode=ParseMode.HTML, reply_markup=kb_cancel(vid),
+        )
+    try:
+        await c.bot.send_chat_action(chat_id=c.message.chat.id, action=ChatAction.UPLOAD_VIDEO)
+    except Exception:
+        pass
 
     try:
         info = await dl_video(url, q)
         file = info["file"]
         size = os.path.getsize(file)
 
-        await status.edit_text(
-            f"📤 <b>Uploading...</b>\n\n"
-            f"🎬 <b>{info['title'][:60]}</b>\n"
-            f"📦 <code>{human_size(size)}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            await status.edit_text(
+                f"📤 <b>Uploading...</b>\n\n"
+                f"🎬 <b>{info['title'][:60]}</b>\n"
+                f"📦 <code>{human_size(size)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
         await c.message.bot.send_video(
             chat_id=c.message.chat.id,
             video=FSInputFile(file),
@@ -378,20 +426,27 @@ async def cb_dl_video(c: CallbackQuery):
             parse_mode=ParseMode.HTML,
             supports_streaming=True,
         )
-        await status.delete()
+        try: await status.delete()
+        except Exception: pass
         try: os.remove(file)
-        except: pass
+        except Exception: pass
     except Exception as e:
         log.exception("Video download failed")
-        await status.edit_text(
-            "❌ <b>Download Failed</b>\n\n"
-            f"<code>{str(e)[:220]}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Retry", callback_data=f"dl:{vid}:{q}")],
-                [InlineKeyboardButton(text="🏠 Menu",  callback_data="back_main")],
-            ]),
-        )
+        err = str(e)[:220]
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Retry", callback_data=f"dl:{vid}:{q}")],
+            [InlineKeyboardButton(text="🏠 Menu",  callback_data="back_main")],
+        ])
+        try:
+            await status.edit_text(
+                f"❌ <b>Download Failed</b>\n\n<code>{err}</code>",
+                parse_mode=ParseMode.HTML, reply_markup=kb,
+            )
+        except Exception:
+            await c.message.answer(
+                f"❌ <b>Download Failed</b>\n\n<code>{err}</code>",
+                parse_mode=ParseMode.HTML, reply_markup=kb,
+            )
 
 # ═══════════════════════════════════════════════════
 #  🎵  DOWNLOAD AUDIO
@@ -401,12 +456,20 @@ async def cb_dl_audio(c: CallbackQuery):
     _, vid, br = c.data.split(":")
     url = f"https://youtube.com/watch?v={vid}"
     await c.answer("🎵 Downloading audio...")
-    status = await c.message.edit_text(
-        f"🎵 <b>Downloading MP3 {br}kbps...</b>\n\n"
-        "⏳ <i>Please wait...</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await c.message.bot.send_chat_action(c.message.chat.id, ChatAction.UPLOAD_VOICE)
+    try:
+        status = await c.message.edit_text(
+            f"🎵 <b>Downloading MP3 {br}kbps...</b>\n\n⏳ <i>Please wait...</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        status = await c.message.answer(
+            f"🎵 <b>Downloading MP3 {br}kbps...</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    try:
+        await c.bot.send_chat_action(chat_id=c.message.chat.id, action=ChatAction.UPLOAD_VOICE)
+    except Exception:
+        pass
 
     try:
         info = await dl_audio(url, br)
@@ -427,19 +490,26 @@ async def cb_dl_audio(c: CallbackQuery):
             ),
             parse_mode=ParseMode.HTML,
         )
-        await status.delete()
+        try: await status.delete()
+        except Exception: pass
         try: os.remove(file)
-        except: pass
+        except Exception: pass
     except Exception as e:
         log.exception("Audio download failed")
-        await status.edit_text(
-            "❌ <b>Audio Failed</b>\n\n"
-            f"<code>{str(e)[:220]}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Menu", callback_data="back_main")]
-            ]),
-        )
+        err = str(e)[:220]
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Menu", callback_data="back_main")]
+        ])
+        try:
+            await status.edit_text(
+                f"❌ <b>Audio Failed</b>\n\n<code>{err}</code>",
+                parse_mode=ParseMode.HTML, reply_markup=kb,
+            )
+        except Exception:
+            await c.message.answer(
+                f"❌ <b>Audio Failed</b>\n\n<code>{err}</code>",
+                parse_mode=ParseMode.HTML, reply_markup=kb,
+            )
 
 # ═══════════════════════════════════════════════════
 #  ❌  CANCEL
@@ -447,13 +517,16 @@ async def cb_dl_audio(c: CallbackQuery):
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(c: CallbackQuery):
     await c.answer("❌ Cancelled", show_alert=True)
-    await c.message.edit_text(
-        "❌ <b>Cancelled.</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🏠 Menu", callback_data="back_main")]
-        ]),
-    )
+    try:
+        await c.message.edit_text(
+            "❌ <b>Cancelled.</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 Menu", callback_data="back_main")]
+            ]),
+        )
+    except Exception:
+        pass
 
 # ═══════════════════════════════════════════════════
 #  🔗  AUTO-DETECT LINKS (fallback)
@@ -475,29 +548,43 @@ async def any_link(m: Message):
 @router.callback_query(F.data.startswith("pickv:"))
 async def cb_pick_v(c: CallbackQuery):
     vid = c.data.split(":")[1]
-    await c.message.edit_text(
-        f"🎬 <b>Video</b> — <code>{vid}</code>\n\n👇 <i>Choose quality:</i>",
-        parse_mode=ParseMode.HTML, reply_markup=kb_quality(vid),
-    )
+    try:
+        await c.message.edit_text(
+            f"🎬 <b>Video</b> — <code>{vid}</code>\n\n👇 <i>Choose quality:</i>",
+            parse_mode=ParseMode.HTML, reply_markup=kb_quality(vid),
+        )
+    except Exception:
+        await c.message.answer(
+            f"🎬 <b>Video</b> — <code>{vid}</code>\n\n👇 <i>Choose quality:</i>",
+            parse_mode=ParseMode.HTML, reply_markup=kb_quality(vid),
+        )
     await c.answer()
 
 @router.callback_query(F.data.startswith("picka:"))
 async def cb_pick_a(c: CallbackQuery):
     vid = c.data.split(":")[1]
-    await c.message.edit_text(
-        f"🎵 <b>Audio</b> — <code>{vid}</code>\n\n👇 <i>Choose bitrate:</i>",
-        parse_mode=ParseMode.HTML, reply_markup=kb_audio(vid),
-    )
+    try:
+        await c.message.edit_text(
+            f"🎵 <b>Audio</b> — <code>{vid}</code>\n\n👇 <i>Choose bitrate:</i>",
+            parse_mode=ParseMode.HTML, reply_markup=kb_audio(vid),
+        )
+    except Exception:
+        await c.message.answer(
+            f"🎵 <b>Audio</b> — <code>{vid}</code>\n\n👇 <i>Choose bitrate:</i>",
+            parse_mode=ParseMode.HTML, reply_markup=kb_audio(vid),
+        )
     await c.answer()
 
 # ═══════════════════════════════════════════════════
 #  🚀  MAIN
 # ═══════════════════════════════════════════════════
 async def main():
+    start_health_server()  # ✅ Render free plan pe sleep nahi hoga
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     log.info("🚀 Bot starting...")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
