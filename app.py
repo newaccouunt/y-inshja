@@ -1,99 +1,161 @@
 import os
-import tempfile
+import re
+from flask import Flask, request, jsonify
 import yt_dlp
-from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 
-DOWNLOAD_DIR = tempfile.gettempdir()
+# ---------- Config ----------
+QUALITY_MAP = {
+    "144p":  ("worstvideo[height<=144]+worstaudio/worst[height<=144]", 144),
+    "240p":  ("bestvideo[height<=240]+bestaudio/best[height<=240]", 240),
+    "360p":  ("bestvideo[height<=360]+bestaudio/best[height<=360]", 360),
+    "480p":  ("bestvideo[height<=480]+bestaudio/best[height<=480]", 480),
+    "720p":  ("bestvideo[height<=720]+bestaudio/best[height<=720]", 720),
+    "1080p": ("bestvideo[height<=1080]+bestaudio/best[height<=1080]", 1080),
+    "best":  ("bestvideo+bestaudio/best", 9999),
+    "audio": ("bestaudio/best", 0),
+}
 
-# Render pe cookies Secret File se aayengi
-COOKIES_PATH = "/etc/secrets/cookies.txt"
-
-def get_ydl_opts(quality="best", fmt="mp4"):
-    if fmt == "mp3":
-        ydl_format = "bestaudio/best"
-        postprocessors = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
-        ext = "mp3"
-    else:
-        if quality == "best":
-            ydl_format = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        else:
-            ydl_format = (
-                f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"best[height<={quality}][ext=mp4]/best"
-            )
-        postprocessors = [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}]
-        ext = "mp4"
-
-    opts = {
-        "format": ydl_format,
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        "merge_output_format": "mp4",
-        "postprocessors": postprocessors,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "restrictfilenames": True,
-    }
-
-    # Cookies agar available hain to use karo (Render pe zaroori)
-    if os.path.exists(COOKIES_PATH):
-        opts["cookiefile"] = COOKIES_PATH
-
-    return opts, ext
+YDL_BASE_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "skip_download": True,
+    "extract_flat": False,
+    "socket_timeout": 30,
+    "retries": 3,
+    "geo_bypass": True,
+    "nocheckcertificate": True,
+    # Render ke datacenter IP ke liye better client
+    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"
+        )
+    },
+}
 
 
-@app.route("/")
+# ---------- Helpers ----------
+def is_valid_url(url: str) -> bool:
+    pattern = re.compile(
+        r"^(https?://)?(www\.)?"
+        r"(youtube\.com|youtu\.be|m\.youtube\.com|music\.youtube\.com)/"
+        r".+",
+        re.IGNORECASE,
+    )
+    return bool(pattern.match(url.strip()))
+
+
+def pick_format(formats, max_height, want_audio=False):
+    """Best format chuno jo quality match kare + audio ho."""
+    if not formats:
+        return None
+
+    if want_audio:
+        audio_only = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
+        if audio_only:
+            return max(audio_only, key=lambda f: f.get("abr") or 0)
+        return None
+
+    # Sirf woh formats jisme video + audio dono ho (progressive) ya video-only
+    candidates = [
+        f for f in formats
+        if f.get("vcodec") not in (None, "none")
+        and f.get("height")
+        and f["height"] <= max_height
+    ]
+    if not candidates:
+        # fallback: koi bhi best
+        candidates = [f for f in formats if f.get("vcodec") not in (None, "none")]
+
+    if not candidates:
+        return None
+
+    # Sabse zyada height wala (par max_height ke andar)
+    return max(candidates, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+
+
+# ---------- Routes ----------
+@app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "ok",
-        "endpoints": "/yt-video-download?link=<url>&quality=360|720|best&format=mp4|mp3"
+        "endpoints": {
+            "/yt": "?link=YOUTUBE_URL&quality=144p|240p|360p|480p|720p|1080p|best|audio"
+        },
+        "example": "/yt?link=https://youtu.be/dQw4w9WgXcQ&quality=720p",
     })
 
 
-@app.route("/yt-video-download")
-def yt_download():
-    link = request.args.get("link")
-    quality = request.args.get("quality", "best")
-    fmt = request.args.get("format", "mp4").lower()
+@app.route("/yt", methods=["GET"])
+def youtube_download():
+    link = request.args.get("link", "").strip()
+    quality = request.args.get("quality", "720p").strip().lower()
 
     if not link:
-        return jsonify({"error": "missing link"}), 400
+        return jsonify({"error": "Missing 'link' parameter"}), 400
+    if not is_valid_url(link):
+        return jsonify({"error": "Invalid YouTube URL"}), 400
+
+    if quality not in QUALITY_MAP:
+        return jsonify({
+            "error": f"Invalid quality '{quality}'",
+            "allowed": list(QUALITY_MAP.keys()),
+        }), 400
+
+    fmt_str, max_height = QUALITY_MAP[quality]
+    ydl_opts = dict(YDL_BASE_OPTS)
+    ydl_opts["format"] = fmt_str
 
     try:
-        ydl_opts, ext = get_ydl_opts(quality, fmt)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(link, download=True)
-            filename = ydl.prepare_filename(info)
+            info = ydl.extract_info(link, download=False)
 
-            base, _ = os.path.splitext(filename)
-            for candidate_ext in (ext, "mp4", "mp3", "m4a", "webm"):
-                candidate = f"{base}.{candidate_ext}"
-                if os.path.exists(candidate):
-                    filename = candidate
-                    break
+            # Playlist case (noplaylist=True hone ke baad bhi safety)
+            if info.get("_type") == "playlist":
+                entries = info.get("entries") or []
+                if not entries:
+                    return jsonify({"error": "Playlist empty"}), 404
+                info = entries[0]
 
-            if not os.path.exists(filename):
-                return jsonify({"error": "download failed"}), 500
-
-            title = info.get("title", "video")
-            safe_title = "".join(c for c in title if c.isalnum() or c in " -_")[:100]
-
-            return send_file(
-                filename,
-                as_attachment=True,
-                download_name=f"{safe_title}.{ext}",
-                mimetype="audio/mpeg" if ext == "mp3" else "video/mp4",
+            formats = info.get("formats") or []
+            chosen = pick_format(
+                formats,
+                max_height,
+                want_audio=(quality == "audio"),
             )
+
+            # Fallback: yt-dlp ka seedha url
+            direct_url = (chosen or {}).get("url") or info.get("url")
+            if not direct_url:
+                return jsonify({"error": "No downloadable format found"}), 404
+
+            return jsonify({
+                "success": True,
+                "title": info.get("title"),
+                "id": info.get("id"),
+                "duration": info.get("duration"),
+                "duration_string": info.get("duration_string"),
+                "thumbnail": info.get("thumbnail"),
+                "uploader": info.get("uploader"),
+                "view_count": info.get("view_count"),
+                "requested_quality": quality,
+                "selected_quality": f"{chosen.get('height')}p" if chosen and chosen.get("height") else chosen.get("format_note", quality) if chosen else quality,
+                "ext": chosen.get("ext") if chosen else info.get("ext"),
+                "filesize": chosen.get("filesize") or chosen.get("filesize_approx") if chosen else None,
+                "download_url": direct_url,
+            }), 200
+
+    except yt_dlp.utils.DownloadError as e:
+        return jsonify({"error": "DownloadError", "detail": str(e)}), 502
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "ServerError", "detail": str(e)}), 500
 
 
+# Render ke liye: gunicorn app:app use karega, ye fallback local ke liye
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
