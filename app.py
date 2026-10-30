@@ -1,161 +1,138 @@
-import os
-import re
+import os, re, logging, random, concurrent.futures, requests
 from flask import Flask, request, jsonify
 import yt_dlp
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# ---------- Config ----------
-QUALITY_MAP = {
-    "144p":  ("worstvideo[height<=144]+worstaudio/worst[height<=144]", 144),
-    "240p":  ("bestvideo[height<=240]+bestaudio/best[height<=240]", 240),
-    "360p":  ("bestvideo[height<=360]+bestaudio/best[height<=360]", 360),
-    "480p":  ("bestvideo[height<=480]+bestaudio/best[height<=480]", 480),
-    "720p":  ("bestvideo[height<=720]+bestaudio/best[height<=720]", 720),
-    "1080p": ("bestvideo[height<=1080]+bestaudio/best[height<=1080]", 1080),
-    "best":  ("bestvideo+bestaudio/best", 9999),
+# ---------- PROXY (simple) ----------
+SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000",
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+]
+
+def get_proxy():
+    proxies = set()
+    def fetch(u):
+        try:
+            r = requests.get(u, timeout=3, headers={"User-Agent": "Mozilla/5.0"})
+            return re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b', r.text)
+        except: return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        for res in ex.map(fetch, SOURCES):
+            proxies.update(res)
+    proxies = list(proxies)
+    random.shuffle(proxies)
+    # test first 10 in parallel
+    def test(p):
+        try:
+            requests.get("http://httpbin.org/ip",
+                         proxies={"http": f"http://{p}", "https": f"http://{p}"},
+                         timeout=2)
+            return p
+        except: return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        for r in ex.map(test, proxies[:10]):
+            if r: return r
+    return None
+
+# ---------- URL CHECK ----------
+def is_yt(u): return bool(re.match(r"^(https?://)?(www\.|m\.)?(youtube\.com|youtu\.be)/", u, re.I))
+def is_fb(u): return bool(re.match(r"^(https?://)?(www\.|m\.|web\.)?(facebook\.com|fb\.watch|fb\.me)/", u, re.I))
+def is_ig(u): return bool(re.match(r"^(https?://)?(www\.)?instagram\.com/", u, re.I))
+
+# ---------- YT-DLP ----------
+QUALITY = {
+    "144p": ("worst[height<=144]", 144),
+    "360p": ("best[height<=360]", 360),
+    "480p": ("best[height<=480]", 480),
+    "720p": ("best[height<=720]", 720),
+    "1080p": ("best[height<=1080]", 1080),
+    "best": ("best", 9999),
     "audio": ("bestaudio/best", 0),
 }
 
-YDL_BASE_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "skip_download": True,
-    "extract_flat": False,
-    "socket_timeout": 30,
-    "retries": 3,
-    "geo_bypass": True,
+BASE = {
+    "quiet": True, "no_warnings": True, "noplaylist": True,
+    "skip_download": True, "socket_timeout": 10, "retries": 1,
     "nocheckcertificate": True,
-    # Render ke datacenter IP ke liye better client
-    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-    "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"
-        )
-    },
+    "http_headers": {"User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/151.0.0.0 Mobile Safari/537.36"},
 }
 
+def extract(url, opts):
+    with yt_dlp.YoutubeDL(opts) as y:
+        info = y.extract_info(url, download=False)
+        if info.get("_type") == "playlist":
+            info = (info.get("entries") or [None])[0]
+        return info
 
-# ---------- Helpers ----------
-def is_valid_url(url: str) -> bool:
-    pattern = re.compile(
-        r"^(https?://)?(www\.)?"
-        r"(youtube\.com|youtu\.be|m\.youtube\.com|music\.youtube\.com)/"
-        r".+",
-        re.IGNORECASE,
-    )
-    return bool(pattern.match(url.strip()))
-
-
-def pick_format(formats, max_height, want_audio=False):
-    """Best format chuno jo quality match kare + audio ho."""
-    if not formats:
-        return None
-
-    if want_audio:
-        audio_only = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
-        if audio_only:
-            return max(audio_only, key=lambda f: f.get("abr") or 0)
-        return None
-
-    # Sirf woh formats jisme video + audio dono ho (progressive) ya video-only
-    candidates = [
-        f for f in formats
-        if f.get("vcodec") not in (None, "none")
-        and f.get("height")
-        and f["height"] <= max_height
-    ]
-    if not candidates:
-        # fallback: koi bhi best
-        candidates = [f for f in formats if f.get("vcodec") not in (None, "none")]
-
-    if not candidates:
-        return None
-
-    # Sabse zyada height wala (par max_height ke andar)
-    return max(candidates, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
-
-
-# ---------- Routes ----------
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "status": "ok",
-        "endpoints": {
-            "/yt": "?link=YOUTUBE_URL&quality=144p|240p|360p|480p|720p|1080p|best|audio"
-        },
-        "example": "/yt?link=https://youtu.be/dQw4w9WgXcQ&quality=720p",
-    })
-
-
-@app.route("/yt", methods=["GET"])
-def youtube_download():
-    link = request.args.get("link", "").strip()
-    quality = request.args.get("quality", "720p").strip().lower()
-
-    if not link:
-        return jsonify({"error": "Missing 'link' parameter"}), 400
-    if not is_valid_url(link):
-        return jsonify({"error": "Invalid YouTube URL"}), 400
-
-    if quality not in QUALITY_MAP:
-        return jsonify({
-            "error": f"Invalid quality '{quality}'",
-            "allowed": list(QUALITY_MAP.keys()),
-        }), 400
-
-    fmt_str, max_height = QUALITY_MAP[quality]
-    ydl_opts = dict(YDL_BASE_OPTS)
-    ydl_opts["format"] = fmt_str
-
+def run(link, quality="720p"):
+    fmt, _ = QUALITY.get(quality, QUALITY["720p"])
+    opts = dict(BASE); opts["format"] = fmt
+    p = get_proxy()
+    if p: opts["proxy"] = f"http://{p}"
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(link, download=False)
+        info = extract(link, opts)
+    except Exception:
+        if p:  # retry without proxy
+            opts.pop("proxy", None); info = extract(link, opts)
+        else: raise
+    url = info.get("url")
+    if not url and info.get("formats"):
+        url = info["formats"][-1]["url"]
+    return {"success": True, "title": info.get("title"),
+            "thumbnail": info.get("thumbnail"),
+            "duration": info.get("duration_string"),
+            "download_url": url, "proxy": p or "direct"}
 
-            # Playlist case (noplaylist=True hone ke baad bhi safety)
-            if info.get("_type") == "playlist":
-                entries = info.get("entries") or []
-                if not entries:
-                    return jsonify({"error": "Playlist empty"}), 404
-                info = entries[0]
+# ---------- ROUTES ----------
+@app.route("/")
+def home(): return jsonify({"endpoints": ["/yt?link=&quality=", "/fb?link=", "/insta?link=", "/auto?link="]})
 
-            formats = info.get("formats") or []
-            chosen = pick_format(
-                formats,
-                max_height,
-                want_audio=(quality == "audio"),
-            )
+@app.route("/yt")
+def yt():
+    link = request.args.get("link","").strip()
+    q = request.args.get("quality","720p").lower()
+    if not link or not is_yt(link): return jsonify({"error":"invalid link"}),400
+    try: return jsonify(run(link,q))
+    except Exception as e: return jsonify({"error":str(e)}),502
 
-            # Fallback: yt-dlp ka seedha url
-            direct_url = (chosen or {}).get("url") or info.get("url")
-            if not direct_url:
-                return jsonify({"error": "No downloadable format found"}), 404
+@app.route("/fb")
+def fb():
+    link = request.args.get("link","").strip()
+    if not link or not is_fb(link): return jsonify({"error":"invalid link"}),400
+    try:
+        info = extract(link, {**BASE, "format":"best"})
+        url = info.get("url") or info["formats"][-1]["url"]
+        return jsonify({"success":True,"title":info.get("title"),"download_url":url})
+    except Exception as e: return jsonify({"error":str(e)}),502
 
-            return jsonify({
-                "success": True,
-                "title": info.get("title"),
-                "id": info.get("id"),
-                "duration": info.get("duration"),
-                "duration_string": info.get("duration_string"),
-                "thumbnail": info.get("thumbnail"),
-                "uploader": info.get("uploader"),
-                "view_count": info.get("view_count"),
-                "requested_quality": quality,
-                "selected_quality": f"{chosen.get('height')}p" if chosen and chosen.get("height") else chosen.get("format_note", quality) if chosen else quality,
-                "ext": chosen.get("ext") if chosen else info.get("ext"),
-                "filesize": chosen.get("filesize") or chosen.get("filesize_approx") if chosen else None,
-                "download_url": direct_url,
-            }), 200
+@app.route("/insta")
+def insta():
+    link = request.args.get("link","").strip()
+    if not link or not is_ig(link): return jsonify({"error":"invalid link"}),400
+    try:
+        info = extract(link, BASE)
+        entries = info.get("entries") or [info]
+        media = []
+        for e in entries:
+            for f in e.get("formats") or []:
+                if f.get("vcodec") not in (None,"none") and f.get("url"):
+                    media.append({"type":"video","url":f["url"]}); break
+            else:
+                if e.get("url"): media.append({"type":"image","url":e["url"]})
+        return jsonify({"success":True,"count":len(media),"media":media})
+    except Exception as e: return jsonify({"error":str(e)}),502
 
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": "DownloadError", "detail": str(e)}), 502
-    except Exception as e:
-        return jsonify({"error": "ServerError", "detail": str(e)}), 500
+@app.route("/auto")
+def auto():
+    link = request.args.get("link","").strip()
+    if not link: return jsonify({"error":"missing link"}),400
+    if is_yt(link): return yt()
+    if is_fb(link): return fb()
+    if is_ig(link): return insta()
+    return jsonify({"error":"unsupported"}),400
 
-
-# Render ke liye: gunicorn app:app use karega, ye fallback local ke liye
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
