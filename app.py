@@ -23,7 +23,21 @@ QUALITY = {
     "audio": ("bestaudio/best", 0),
 }
 
-# Render ke liye base options
+# PEHLE BASE DEFINE KAREIN, PHIR extractor_args ADD KAREIN
+BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "skip_download": True,
+    "socket_timeout": 15,
+    "retries": 1,
+    "nocheckcertificate": True,
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/151.0.0.0 Mobile Safari/537.36"
+    },
+}
+
+# Ab BASE exist karti hai, isliye yeh line kaam karegi
 BASE["extractor_args"] = {
     "youtube": {
         "player_client": ["mweb"],
@@ -31,19 +45,18 @@ BASE["extractor_args"] = {
     },
 }
 
-# Cookies file path (Render par /etc/secrets/ mein rakhna hoga)
+# Cookies file path (Render Secret File)
 COOKIE_PATH = "/etc/secrets/cookies.txt"
 
 def get_opts(quality="720p"):
     fmt, _ = QUALITY.get(quality, QUALITY["720p"])
     opts = dict(BASE)
     opts["format"] = fmt
-    # Agar cookies file exist karti hai, toh use karo
     if os.path.exists(COOKIE_PATH):
         opts["cookiefile"] = COOKIE_PATH
         logging.info("Using cookies.txt")
     else:
-        logging.warning("cookies.txt not found, trying without cookies")
+        logging.warning("cookies.txt not found")
     return opts
 
 def extract(url, opts):
@@ -56,7 +69,7 @@ def extract(url, opts):
 # ---------- Routes ----------
 @app.route("/")
 def home():
-    return jsonify({"status": "ok", "note": "Render deployment with cookies"})
+    return jsonify({"status": "ok"})
 
 @app.route("/yt")
 def yt():
@@ -64,7 +77,6 @@ def yt():
     q = request.args.get("quality", "720p").lower()
     if not link or not is_yt(link):
         return jsonify({"error": "invalid link"}), 400
-    
     try:
         info = extract(link, get_opts(q))
         url = info.get("url")
@@ -112,16 +124,6 @@ def insta():
         return jsonify({"success": True, "count": len(media), "media": media})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
-
-@app.route("/auto")
-def auto():
-    link = request.args.get("link", "").strip()
-    if not link:
-        return jsonify({"error": "missing link"}), 400
-    if is_yt(link): return yt()
-    if is_fb(link): return fb()
-    if is_ig(link): return insta()
-    return jsonify({"error": "unsupported"}), 400
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
