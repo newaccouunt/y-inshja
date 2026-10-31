@@ -24,20 +24,10 @@ QUALITY = {
 }
 
 # Render ke liye base options
-BASE = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "skip_download": True,
-    "socket_timeout": 15,
-    "retries": 1,
-    "nocheckcertificate": True,
-    "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/151.0.0.0 Mobile Safari/537.36"
-    },
-    # Cloud IP ke liye zaroori: mweb client PO Token flow trigger karega
-    "extractor_args": {
-        "youtube": {"player_client": ["mweb", "tv"]},
+BASE["extractor_args"] = {
+    "youtube": {
+        "player_client": ["mweb"],
+        "po_token": ["mweb+web:http://bgutil-provider:4416"],
     },
 }
 
